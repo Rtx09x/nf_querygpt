@@ -112,6 +112,7 @@ export type PromptInputTextareaProps = {
 function PromptInputTextarea({
   className,
   onKeyDown,
+  onInput,
   disableAutosize = false,
   ...props
 }: PromptInputTextareaProps) {
@@ -154,6 +155,12 @@ function PromptInputTextarea({
     setValue(e.target.value)
   }
 
+  const handleInput = (e: React.FormEvent<HTMLTextAreaElement>) => {
+    adjustHeight(e.currentTarget)
+    setValue(e.currentTarget.value)
+    onInput?.(e as Parameters<NonNullable<typeof onInput>>[0])
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault()
@@ -167,6 +174,7 @@ function PromptInputTextarea({
       ref={handleRef}
       value={value}
       onChange={handleChange}
+      onInput={handleInput}
       onKeyDown={handleKeyDown}
       className={cn(
         "text-primary min-h-[44px] w-full resize-none border-none bg-transparent shadow-none outline-none focus-visible:ring-0 focus-visible:ring-offset-0",
