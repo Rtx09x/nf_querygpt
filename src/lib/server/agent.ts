@@ -474,6 +474,34 @@ function isNumeric(value: unknown) {
   return typeof value === "number" && Number.isFinite(value)
 }
 
+function isMetricColumn(column: string) {
+  return /(count|users|active|revenue|amount|payments|tickets|reports|views|messages|rate|csat|profiles|subscriptions|interests|matches|metric|total|avg|pct|score)/i.test(
+    column,
+  )
+}
+
+function isIdentifierColumn(column: string) {
+  return /(^id$|_id$|user_id|profile_id|match_id|payment_id|ticket_id|report_id|view_id|message_id|subscription_id|plan_id|interest_id)/i.test(
+    column,
+  )
+}
+
+function metricPriority(column: string) {
+  const priorities = [
+    /revenue|amount|income/i,
+    /unread/i,
+    /active_users/i,
+    /profile_views|views/i,
+    /reports/i,
+    /tickets/i,
+    /users|profiles|subscriptions|payments|messages|interests|matches/i,
+    /metric_value|total|count/i,
+    /avg|rate|pct|score|csat/i,
+  ]
+  const index = priorities.findIndex((pattern) => pattern.test(column))
+  return index === -1 ? priorities.length : index
+}
+
 function resultParts(result: ReturnType<typeof runReadonlyQuery>, view: string): ChatPart[] {
   const parts: ChatPart[] = [
     {
@@ -502,15 +530,23 @@ function resultParts(result: ReturnType<typeof runReadonlyQuery>, view: string):
     }
   }
 
-  const numericColumn = result.columns.find((column) =>
+  const numericCandidates = result.columns.filter((column) =>
     result.rows.some((row) => isNumeric(row[column])),
   )
-  const labelColumn = result.columns.find((column) => column !== numericColumn)
+  const numericColumn =
+    numericCandidates
+      .filter((column) => isMetricColumn(column) && !isIdentifierColumn(column))
+      .sort((a, b) => metricPriority(a) - metricPriority(b))[0] ??
+    numericCandidates.find((column) => !isIdentifierColumn(column)) ??
+    numericCandidates[0]
+  const labelColumn =
+    result.columns.find((column) => column !== numericColumn && !numericCandidates.includes(column)) ??
+    result.columns.find((column) => column !== numericColumn)
   if (
     numericColumn &&
     labelColumn &&
     result.rows.length > 1 &&
-    ["bar", "line", "auto"].includes(view)
+    view !== "stats"
   ) {
     const line =
       view === "line" ||
@@ -571,16 +607,17 @@ async function planWithMainAgent(input: AgentRunInput): Promise<MainPlan> {
   const main = createModelHandle(settings.mainAgent)
   const fallback = deterministicSql(input.question)
 
-  if (!main.configured || !main.model) {
-    if (fallback) {
-      return {
-        route: "database",
-        cleanedWorkerPrompt: input.question,
-        reasoning: "No main-agent key configured; deterministic routing matched a database intent.",
-        expectedView: fallback.view,
-        clarificationOptions: [],
-      }
+  if (fallback) {
+    return {
+      route: "database",
+      cleanedWorkerPrompt: input.question,
+      reasoning: "Deterministic router matched a known database intent.",
+      expectedView: fallback.view,
+      clarificationOptions: [],
     }
+  }
+
+  if (!main.configured || !main.model) {
     return {
       route: "clarify",
       cleanedWorkerPrompt: input.question,
@@ -597,10 +634,11 @@ async function planWithMainAgent(input: AgentRunInput): Promise<MainPlan> {
     }
   }
 
-  const { object } = await generateObject({
-    model: main.model,
-    schema: mainPlanSchema,
-    prompt: `
+  try {
+    const { object } = await generateObject({
+      model: main.model,
+      schema: mainPlanSchema,
+      prompt: `
 You are the main reasoning agent for NF QueryGPT.
 
 Decide whether the user needs:
@@ -631,9 +669,25 @@ ${input.question}
 
 Return a concise, precise worker prompt when route is database. Do not invent unavailable schema.
     `,
-  })
+    })
 
-  return object
+    return object
+  } catch (error) {
+    return {
+      route: "clarify",
+      cleanedWorkerPrompt: input.question,
+      reasoning: `Main agent failed: ${error instanceof Error ? error.message : "unknown error"}`,
+      clarificationQuestion:
+        "The model provider is unavailable or rate-limited. I can still answer common database questions like revenue, users, matches, support, reports, cities, messages, and profiles. Which one should I analyze?",
+      clarificationOptions: [
+        "Top active-user cities",
+        "Revenue trend",
+        "Match funnel",
+        "Support tickets",
+      ],
+      expectedView: "auto",
+    }
+  }
 }
 
 async function workerSql(input: {
@@ -645,15 +699,17 @@ async function workerSql(input: {
   const worker = createModelHandle(settings.workerAgent)
   const fallback = deterministicSql(input.cleanedWorkerPrompt) ?? deterministicSql(input.question)
 
+  if (fallback) return fallback
+
   if (!worker.configured || !worker.model) {
-    if (fallback) return fallback
     throw new Error("Worker agent key is not configured and no deterministic SQL template matched.")
   }
 
-  const { object } = await generateObject({
-    model: worker.model,
-    schema: workerSqlSchema,
-    prompt: `
+  try {
+    const { object } = await generateObject({
+      model: worker.model,
+      schema: workerSqlSchema,
+      prompt: `
 You are the worker database agent for NF QueryGPT.
 
 Generate one safe SQLite SELECT or WITH query only. No mutation. No PRAGMA. No ATTACH.
@@ -675,9 +731,12 @@ ${input.cleanedWorkerPrompt}
 
 If the task is ambiguous, choose the safest useful aggregate and explain the assumption.
     `,
-  })
+    })
 
-  return object
+    return object
+  } catch (error) {
+    throw error
+  }
 }
 
 async function finalAnswer(input: {

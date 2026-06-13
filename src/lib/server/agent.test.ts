@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
-import { deterministicSql } from "@/lib/server/agent"
+import { type Thread } from "@/lib/querygpt/types"
+import { deterministicSql, runQueryGptAgent } from "@/lib/server/agent"
 import { runReadonlyQuery } from "@/lib/server/sql-gateway"
 
 const evalPrompts = [
@@ -64,4 +65,69 @@ describe("deterministic agent plans", () => {
       expect(result.rows.length).toBeGreaterThanOrEqual(minRows)
     },
   )
+
+  it("answers matched eval prompts without requiring a provider call", async () => {
+    const thread: Thread = {
+      id: "test-thread",
+      title: "New chat",
+      provider: "gemini",
+      model: "gemini-2.5-flash",
+      pinned: false,
+      archived: false,
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    }
+    const result = await runQueryGptAgent({
+      thread,
+      question: "Age distribution of users",
+    })
+    expect(result.parts.some((part) => part.type === "sql")).toBe(true)
+    expect(result.parts.some((part) => part.type === "chart")).toBe(true)
+    expect(result.parts.some((part) => part.type === "error")).toBe(false)
+  })
+
+  it("uses the business metric, not identifier columns, for generated charts", async () => {
+    const thread: Thread = {
+      id: "test-thread",
+      title: "New chat",
+      provider: "gemini",
+      model: "gemini-2.5-flash",
+      pinned: false,
+      archived: false,
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    }
+    const result = await runQueryGptAgent({
+      thread,
+      question: "Most viewed profiles",
+    })
+    const chart = result.parts.find((part) => part.type === "chart")
+    expect(chart?.type === "chart" ? chart.yKey : null).toBe("profile_views")
+  })
+
+  it("prioritizes revenue and unread metrics for chart y axes", async () => {
+    const thread: Thread = {
+      id: "test-thread",
+      title: "New chat",
+      provider: "gemini",
+      model: "gemini-2.5-flash",
+      pinned: false,
+      archived: false,
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    }
+    const revenue = await runQueryGptAgent({
+      thread,
+      question: "Which plan generated the most revenue?",
+    })
+    const revenueChart = revenue.parts.find((part) => part.type === "chart")
+    expect(revenueChart?.type === "chart" ? revenueChart.yKey : null).toBe("revenue_inr")
+
+    const unread = await runQueryGptAgent({
+      thread,
+      question: "Unread messages trend",
+    })
+    const unreadChart = unread.parts.find((part) => part.type === "chart")
+    expect(unreadChart?.type === "chart" ? unreadChart.yKey : null).toBe("unread_messages")
+  })
 })
