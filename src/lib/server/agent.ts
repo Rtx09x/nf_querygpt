@@ -50,8 +50,41 @@ function titleFromQuestion(question: string) {
   return `${compact.slice(0, 41)}...`
 }
 
-function deterministicSql(question: string): DeterministicPlan | null {
+const knownCities = [
+  "Delhi",
+  "Mumbai",
+  "Hyderabad",
+  "Bengaluru",
+  "Lucknow",
+  "Kolkata",
+  "Chennai",
+  "Bhopal",
+  "Srinagar",
+  "Patna",
+  "Jaipur",
+  "Aligarh",
+]
+
+function quoted(value: string) {
+  return value.replace(/'/g, "''")
+}
+
+function cityIn(question: string) {
   const q = lower(question)
+  return knownCities.find((city) => q.includes(city.toLowerCase())) ?? null
+}
+
+function userStatusFilter(question: string) {
+  const q = lower(question)
+  if (/(deactivated|inactive|disabled)/.test(q)) return "LOWER(account_status) = 'deactivated'"
+  if (/(suspended|blocked|banned)/.test(q)) return "LOWER(account_status) = 'suspended'"
+  if (/(active|currently active|live users)/.test(q)) return "LOWER(account_status) = 'active'"
+  return "1 = 1"
+}
+
+export function deterministicSql(question: string): DeterministicPlan | null {
+  const q = lower(question)
+  const requestedCity = cityIn(question)
 
   if (/(schema|relationship|graph|tables|columns|database structure)/.test(q)) {
     return {
@@ -73,12 +106,62 @@ function deterministicSql(question: string): DeterministicPlan | null {
     }
   }
 
-  if (/(how many|count|total).*(user|member|profile)/.test(q)) {
+  if (
+    requestedCity &&
+    /(how many|count|total).*(user|member|profile|active)|active.*(user|member|profile)/.test(q)
+  ) {
+    return {
+      sql: `
+        SELECT
+          city,
+          COUNT(*) AS users,
+          SUM(CASE WHEN LOWER(account_status) = 'active' THEN 1 ELSE 0 END) AS active_users,
+          SUM(is_verified) AS verified_users
+        FROM users
+        WHERE city = '${quoted(requestedCity)}'
+        GROUP BY city
+      `,
+      explanation: `User count for ${requestedCity}.`,
+      view: "stats",
+    }
+  }
+
+  if (/(city|cities|location|state|where|delhi|mumbai|hyderabad|bengaluru|lucknow|kolkata|chennai)/.test(q)) {
+    return {
+      sql: `
+        SELECT city, state, COUNT(*) AS active_users
+        FROM users
+        WHERE ${userStatusFilter(question)}
+        GROUP BY city, state
+        ORDER BY active_users DESC
+        LIMIT 15
+      `,
+      explanation: "Top user locations using the requested account-status filter.",
+      view: "bar",
+    }
+  }
+
+  if (/(recent|last active|active.*30|30 days|dau|mau)/.test(q)) {
+    return {
+      sql: `
+        SELECT
+          COUNT(*) AS active_last_30_days,
+          ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM users), 2) AS pct_of_users
+        FROM users
+        WHERE last_active_at >= datetime((SELECT MAX(last_active_at) FROM users), '-30 days')
+      `,
+      explanation: "Users active in the last 30 days of the dataset window.",
+      view: "stats",
+    }
+  }
+
+  if (/(how many|count|total).*(user|member|profile)|user base|members/.test(q)) {
     return {
       sql: `
         SELECT
           COUNT(*) AS total_users,
-          SUM(CASE WHEN account_status = 'active' THEN 1 ELSE 0 END) AS active_users,
+          SUM(CASE WHEN LOWER(account_status) = 'active' THEN 1 ELSE 0 END) AS active_users,
+          SUM(CASE WHEN LOWER(account_status) = 'suspended' THEN 1 ELSE 0 END) AS suspended_users,
           SUM(is_verified) AS verified_users
         FROM users
       `,
@@ -100,17 +183,23 @@ function deterministicSql(question: string): DeterministicPlan | null {
     }
   }
 
-  if (/(revenue|payment|earn|sales|income)/.test(q)) {
+  if (/(plan|subscription|premium|package).*(revenue|payment|earn|sales|income)|(revenue|payment).*(plan|subscription|premium|package)/.test(q)) {
     return {
       sql: `
-        SELECT strftime('%Y-%m', created_at) AS month, SUM(amount_inr) AS revenue_inr
-        FROM payments
-        WHERE status = 'success'
-        GROUP BY month
-        ORDER BY month
+        SELECT
+          pl.plan_name,
+          COUNT(p.payment_id) AS successful_payments,
+          SUM(p.amount_inr) AS revenue_inr,
+          ROUND(AVG(p.amount_inr), 2) AS avg_payment_inr
+        FROM payments p
+        JOIN subscriptions s ON s.subscription_id = p.subscription_id
+        JOIN plans pl ON pl.plan_id = s.plan_id
+        WHERE LOWER(p.status) = 'success'
+        GROUP BY pl.plan_id, pl.plan_name
+        ORDER BY revenue_inr DESC
       `,
-      explanation: "Monthly successful payment revenue.",
-      view: "line",
+      explanation: "Successful payment revenue by subscription plan.",
+      view: "bar",
     }
   }
 
@@ -119,7 +208,7 @@ function deterministicSql(question: string): DeterministicPlan | null {
       sql: `
         SELECT method, COUNT(*) AS payments, SUM(amount_inr) AS revenue_inr
         FROM payments
-        WHERE status = 'success'
+        WHERE LOWER(status) = 'success'
         GROUP BY method
         ORDER BY revenue_inr DESC
       `,
@@ -128,17 +217,77 @@ function deterministicSql(question: string): DeterministicPlan | null {
     }
   }
 
+  if (/(revenue|payment|earn|sales|income)/.test(q)) {
+    return {
+      sql: `
+        SELECT strftime('%Y-%m', created_at) AS month, SUM(amount_inr) AS revenue_inr
+        FROM payments
+        WHERE LOWER(status) = 'success'
+        GROUP BY month
+        ORDER BY month
+      `,
+      explanation: "Monthly successful payment revenue.",
+      view: "line",
+    }
+  }
+
   if (/(funnel|conversion|interest.*match|match.*message)/.test(q)) {
     return {
       sql: `
-        SELECT 'users' AS stage, COUNT(*) AS count FROM users
+        SELECT 'users' AS stage, COUNT(*) AS metric_value FROM users
         UNION ALL SELECT 'interests_sent', COUNT(*) FROM interests
-        UNION ALL SELECT 'interests_accepted', COUNT(*) FROM interests WHERE status = 'accepted'
+        UNION ALL SELECT 'interests_accepted', COUNT(*) FROM interests WHERE LOWER(status) = 'accepted'
         UNION ALL SELECT 'matches', COUNT(*) FROM matches
         UNION ALL SELECT 'messages', COUNT(*) FROM messages
       `,
       explanation: "Relationship funnel from users to messages.",
       view: "bar",
+    }
+  }
+
+  if (/(interest|accepted|declined|pending|acceptance rate|response rate)/.test(q)) {
+    return {
+      sql: `
+        SELECT
+          status,
+          COUNT(*) AS interests,
+          ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM interests), 2) AS pct_of_interests
+        FROM interests
+        GROUP BY status
+        ORDER BY interests DESC
+      `,
+      explanation: "Interest outcomes and share of total interests.",
+      view: "bar",
+    }
+  }
+
+  if (/(match|matched).*(month|trend|growth|time)|monthly matches/.test(q)) {
+    return {
+      sql: `
+        SELECT strftime('%Y-%m', matched_at) AS month, COUNT(*) AS matches
+        FROM matches
+        GROUP BY month
+        ORDER BY month
+      `,
+      explanation: "Monthly match trend.",
+      view: "line",
+    }
+  }
+
+  if (/(message|chat|conversation|unread|read rate)/.test(q)) {
+    return {
+      sql: `
+        SELECT
+          strftime('%Y-%m', sent_at) AS month,
+          COUNT(*) AS messages,
+          SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) AS unread_messages,
+          ROUND(100.0 * SUM(CASE WHEN is_read = 1 THEN 1 ELSE 0 END) / COUNT(*), 2) AS read_rate_pct
+        FROM messages
+        GROUP BY month
+        ORDER BY month
+      `,
+      explanation: "Monthly message volume and read rate.",
+      view: "line",
     }
   }
 
@@ -149,7 +298,11 @@ function deterministicSql(question: string): DeterministicPlan | null {
           category,
           COUNT(*) AS tickets,
           ROUND(AVG(csat_score), 2) AS avg_csat,
-          SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_tickets
+          SUM(CASE WHEN LOWER(status) = 'open' THEN 1 ELSE 0 END) AS open_tickets,
+          ROUND(AVG(CASE
+            WHEN resolved_at IS NOT NULL THEN (julianday(resolved_at) - julianday(created_at)) * 24
+            ELSE NULL
+          END), 2) AS avg_resolution_hours
         FROM support_tickets
         GROUP BY category
         ORDER BY tickets DESC
@@ -172,30 +325,53 @@ function deterministicSql(question: string): DeterministicPlan | null {
     }
   }
 
-  if (/(city|cities|location|state|where)/.test(q)) {
+  if (/(age|dob|old|younger|older)/.test(q)) {
     return {
       sql: `
-        SELECT city, state, COUNT(*) AS users
+        SELECT
+          CASE
+            WHEN CAST((julianday((SELECT MAX(last_active_at) FROM users)) - julianday(dob)) / 365.25 AS INTEGER) < 25 THEN 'under_25'
+            WHEN CAST((julianday((SELECT MAX(last_active_at) FROM users)) - julianday(dob)) / 365.25 AS INTEGER) < 30 THEN '25_29'
+            WHEN CAST((julianday((SELECT MAX(last_active_at) FROM users)) - julianday(dob)) / 365.25 AS INTEGER) < 35 THEN '30_34'
+            WHEN CAST((julianday((SELECT MAX(last_active_at) FROM users)) - julianday(dob)) / 365.25 AS INTEGER) < 40 THEN '35_39'
+            ELSE '40_plus'
+          END AS age_band,
+          COUNT(*) AS users
         FROM users
-        WHERE account_status = 'active'
-        GROUP BY city, state
+        GROUP BY age_band
         ORDER BY users DESC
-        LIMIT 15
       `,
-      explanation: "Top active-user locations.",
+      explanation: "User age distribution based on DOB and the dataset activity window.",
       view: "bar",
     }
   }
 
-  if (/(gender|male|female)/.test(q)) {
+  if (/(gender|male|female|sect|sunni|shia|education|profession|occupation|job|marital|mother tongue|language|managed by|income)/.test(q)) {
+    const dimension =
+      /(sect|sunni|shia)/.test(q)
+        ? "sect"
+        : /education/.test(q)
+          ? "education_level"
+          : /(profession|occupation|job)/.test(q)
+            ? "profession"
+            : /marital/.test(q)
+              ? "marital_status"
+              : /(mother tongue|language)/.test(q)
+                ? "mother_tongue"
+                : /managed by/.test(q)
+                  ? "managed_by"
+                  : /income/.test(q)
+                    ? "annual_income_inr"
+                    : "gender"
     return {
       sql: `
-        SELECT gender, COUNT(*) AS users
+        SELECT ${dimension}, COUNT(*) AS users
         FROM users
-        GROUP BY gender
+        GROUP BY ${dimension}
         ORDER BY users DESC
+        LIMIT 15
       `,
-      explanation: "User count by gender.",
+      explanation: `User count by ${dimension.replace(/_/g, " ")}.`,
       view: "bar",
     }
   }
@@ -214,6 +390,25 @@ function deterministicSql(question: string): DeterministicPlan | null {
     }
   }
 
+  if (/(partner preference|preferences|preferred|looking for)/.test(q)) {
+    return {
+      sql: `
+        SELECT
+          preferred_sect,
+          min_education,
+          COUNT(*) AS users,
+          ROUND(AVG(min_age), 1) AS avg_min_age,
+          ROUND(AVG(max_age), 1) AS avg_max_age
+        FROM partner_preferences
+        GROUP BY preferred_sect, min_education
+        ORDER BY users DESC
+        LIMIT 15
+      `,
+      explanation: "Partner preference patterns by sect and minimum education.",
+      view: "table",
+    }
+  }
+
   if (/(plan|subscription|premium|package)/.test(q)) {
     return {
       sql: `
@@ -221,7 +416,7 @@ function deterministicSql(question: string): DeterministicPlan | null {
           p.plan_name,
           p.price_inr,
           COUNT(s.subscription_id) AS subscriptions,
-          SUM(CASE WHEN s.status = 'active' THEN 1 ELSE 0 END) AS active_subscriptions
+          SUM(CASE WHEN LOWER(s.status) = 'active' THEN 1 ELSE 0 END) AS active_subscriptions
         FROM plans p
         LEFT JOIN subscriptions s ON s.plan_id = p.plan_id
         GROUP BY p.plan_id, p.plan_name, p.price_inr
@@ -229,6 +424,25 @@ function deterministicSql(question: string): DeterministicPlan | null {
       `,
       explanation: "Subscription volume by plan.",
       view: "table",
+    }
+  }
+
+  if (/(profile view|views|viewed most|most viewed)/.test(q)) {
+    return {
+      sql: `
+        SELECT
+          u.user_id,
+          u.city,
+          u.gender,
+          COUNT(pv.view_id) AS profile_views
+        FROM profile_views pv
+        JOIN users u ON u.user_id = pv.viewed_id
+        GROUP BY u.user_id, u.city, u.gender
+        ORDER BY profile_views DESC
+        LIMIT 15
+      `,
+      explanation: "Most viewed profiles with basic user attributes.",
+      view: "bar",
     }
   }
 
@@ -324,7 +538,7 @@ function resultParts(result: ReturnType<typeof runReadonlyQuery>, view: string):
 
 function fallbackFinalAnswer(question: string, explanation: string, result: ReturnType<typeof runReadonlyQuery>) {
   if (result.rows.length === 0) {
-    return `I ran the database query for: "${question}". It returned no rows.`
+    return `${explanation} The query returned no rows, so there is no chartable result for this request.`
   }
 
   const firstRow = result.rows[0]
@@ -337,9 +551,19 @@ function fallbackFinalAnswer(question: string, explanation: string, result: Retu
 
   if (singleMetric) return `${explanation} ${singleMetric}.`
 
+  const topValues = result.rows
+    .slice(0, 3)
+    .map((row) =>
+      Object.entries(row)
+        .slice(0, 3)
+        .map(([key, value]) => `${key.replace(/_/g, " ")} ${value}`)
+        .join(", "),
+    )
+    .join("; ")
+
   return `${explanation} I found ${result.totalRows} row${
     result.totalRows === 1 ? "" : "s"
-  }. The table and SQL are shown below.`
+  }. Top results: ${topValues}.`
 }
 
 async function planWithMainAgent(input: AgentRunInput): Promise<MainPlan> {
@@ -391,6 +615,14 @@ ${dataWindowSummary()}
 Database schema:
 ${schemaSummary()}
 
+Important enum values:
+- users.account_status is lowercase: active, deactivated, suspended.
+- payments.status is lowercase: success, failed, refunded.
+- subscriptions.status is lowercase: active, expired, cancelled.
+- interests.status is lowercase: pending, accepted, declined.
+- support_tickets.status is lowercase: open, resolved, closed.
+- reports.status is lowercase: open, actioned, dismissed.
+
 Attachment context:
 ${input.attachmentContext || "None"}
 
@@ -430,6 +662,14 @@ Reasoning level selected by user: ${settings.workerAgent.reasoning}.
 Database schema:
 ${schemaSummary()}
 
+Important enum values:
+- users.account_status is lowercase: active, deactivated, suspended.
+- payments.status is lowercase: success, failed, refunded.
+- subscriptions.status is lowercase: active, expired, cancelled.
+- interests.status is lowercase: pending, accepted, declined.
+- support_tickets.status is lowercase: open, resolved, closed.
+- reports.status is lowercase: open, actioned, dismissed.
+
 Worker task:
 ${input.cleanedWorkerPrompt}
 
@@ -445,36 +685,7 @@ async function finalAnswer(input: {
   explanation: string
   result: ReturnType<typeof runReadonlyQuery>
 }) {
-  const settings = getAppSettings()
-  const main = createModelHandle(settings.mainAgent)
-  if (!main.configured || !main.model) {
-    return fallbackFinalAnswer(input.question, input.explanation, input.result)
-  }
-
-  const sampleRows = JSON.stringify(input.result.rows.slice(0, 10), null, 2)
-  const { text } = await generateText({
-    model: main.model,
-    prompt: `
-You are the final answer agent for NF QueryGPT. Write a concise answer in the user's language/style.
-Mention any assumptions and point out that SQL/results are shown below. Do not invent facts beyond the rows.
-
-User question:
-${input.question}
-
-Worker explanation:
-${input.explanation}
-
-SQL:
-${input.result.sql}
-
-Columns: ${input.result.columns.join(", ")}
-Returned rows: ${input.result.totalRows}
-Sample rows:
-${sampleRows}
-    `,
-  })
-
-  return text.trim()
+  return fallbackFinalAnswer(input.question, input.explanation, input.result)
 }
 
 export async function runQueryGptAgent(input: AgentRunInput) {
@@ -538,11 +749,15 @@ User message: ${input.question}
   })
   let result: ReturnType<typeof runReadonlyQuery>
   let finalSqlPlan = sqlPlan
+  const fallback =
+    deterministicSql(plan.cleanedWorkerPrompt) ?? deterministicSql(input.question)
   try {
     result = runReadonlyQuery({ sql: sqlPlan.sql })
+    if (result.rows.length === 0 && fallback) {
+      finalSqlPlan = fallback
+      result = runReadonlyQuery({ sql: fallback.sql })
+    }
   } catch (error) {
-    const fallback =
-      deterministicSql(plan.cleanedWorkerPrompt) ?? deterministicSql(input.question)
     if (!fallback) throw error
     finalSqlPlan = fallback
     result = runReadonlyQuery({ sql: fallback.sql })

@@ -10,6 +10,7 @@ import { tableNames } from "@/lib/server/schema-catalog"
 const bannedPattern =
   /\b(insert|update|delete|drop|alter|create|replace|truncate|pragma|attach|detach|vacuum|reindex|begin|commit|rollback|savepoint|release|load_extension)\b/i
 const relationPattern = /\b(from|join)\s+["'`]?([a-zA-Z_][\w]*)["'`]?/gi
+const ctePattern = /(?:\bwith\b|,)\s+(?:recursive\s+)?["'`]?([a-zA-Z_][\w]*)["'`]?\s+as\s*\(/gi
 const parser = new Parser()
 
 function normalizeSql(sql: string) {
@@ -54,7 +55,14 @@ function assertReadOnly(sql: string) {
   }
 
   const allowedTables = new Set(tableNames())
+  let cteMatch: RegExpExecArray | null
+  ctePattern.lastIndex = 0
+  while ((cteMatch = ctePattern.exec(normalized))) {
+    allowedTables.add(cteMatch[1])
+  }
+
   let match: RegExpExecArray | null
+  relationPattern.lastIndex = 0
   while ((match = relationPattern.exec(normalized))) {
     const table = match[2]
     if (!allowedTables.has(table) && !table.startsWith("upload_")) {
@@ -107,19 +115,20 @@ export function runReadonlyQuery(input: {
     db.pragma("query_only = ON")
     db.pragma("foreign_keys = ON")
 
-    const visibleRowsRaw = db.prepare(wrapWithLimit(sql, visibleLimit)).all() as Record<
-      string,
-      unknown
-    >[]
-    const truncated = visibleRowsRaw.length > visibleLimit
+    const totalRows = (
+      db.prepare(`SELECT COUNT(*) AS count FROM (${sql}) AS querygpt_count`).get() as {
+        count: number
+      }
+    ).count
+    const visibleStatement = db.prepare(wrapWithLimit(sql, visibleLimit))
+    const columns = visibleStatement.columns().map((column) => column.name)
+    const visibleRowsRaw = visibleStatement.all() as Record<string, unknown>[]
     const visibleRows = visibleRowsRaw.slice(0, visibleLimit).map((row) =>
       Object.fromEntries(
         Object.entries(row).map(([key, value]) => [key, scalar(value)]),
       ) as Record<string, SqlScalar>,
     )
-    const columns = visibleRowsRaw[0] ? Object.keys(visibleRowsRaw[0]) : []
-
-    const exportRowsRaw = truncated
+    const exportRowsRaw = totalRows > visibleLimit
       ? (db.prepare(wrapWithLimit(sql, exportLimit)).all() as Record<string, unknown>[])
       : visibleRowsRaw
     const exportRows = exportRowsRaw.map((row) =>
@@ -140,8 +149,8 @@ export function runReadonlyQuery(input: {
       sql,
       columns,
       rows: visibleRows,
-      totalRows: exportRows.length,
-      truncated,
+      totalRows,
+      truncated: totalRows > visibleLimit,
       elapsedMs: Math.round(performance.now() - start),
       exportId,
     }

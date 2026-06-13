@@ -17,14 +17,14 @@ const providerCatalog: Record<ProviderId, Omit<ProviderConfig, "keyConfigured" |
   openai: {
     id: "openai",
     label: "OpenAI",
-    defaultModel: "gpt-5.4-mini",
-    models: ["gpt-5.4-mini", "gpt-5.5", "gpt-5.4"],
+    defaultModel: "gpt-4.1-mini",
+    models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
   },
   gemini: {
     id: "gemini",
     label: "Gemini",
-    defaultModel: "gemini-3.5-flash",
-    models: ["gemini-3.5-flash", "gemini-3.5-pro", "gemini-2.5-pro"],
+    defaultModel: "gemini-2.5-flash",
+    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
   },
 }
 
@@ -181,21 +181,39 @@ export function listProviderConfigs(): ProviderConfig[] {
 }
 
 export function getAppSettings(): AppSettings {
-  const defaultProvider = getSetting<ProviderId>("defaultProvider", "openai")
-  const defaultModel = getSetting<string>(
-    "defaultModel",
-    providerCatalog[defaultProvider].defaultModel,
-  )
-  const mainAgent = getSetting<AppSettings["mainAgent"]>("mainAgent", {
-    provider: "openai",
-    model: "gpt-5.5",
+  const providers = listProviderConfigs()
+  const configuredFallback = providers.find((provider) => provider.keyConfigured)?.id
+  const savedDefaultProvider = getSetting<ProviderId>("defaultProvider", "openai")
+  const savedDefaultConfigured =
+    providers.find((provider) => provider.id === savedDefaultProvider)?.keyConfigured ?? false
+  const defaultProvider: ProviderId = savedDefaultConfigured
+    ? savedDefaultProvider
+    : (configuredFallback ?? savedDefaultProvider)
+  const defaultModel =
+    defaultProvider === savedDefaultProvider
+      ? getSetting<string>("defaultModel", providerCatalog[defaultProvider].defaultModel)
+      : providerCatalog[defaultProvider].defaultModel
+  const savedMainAgent = getSetting<AppSettings["mainAgent"]>("mainAgent", {
+    provider: defaultProvider,
+    model: providerCatalog[defaultProvider].defaultModel,
     reasoning: "high",
   })
-  const workerAgent = getSetting<AppSettings["workerAgent"]>("workerAgent", {
+  const savedWorkerAgent = getSetting<AppSettings["workerAgent"]>("workerAgent", {
     provider: "gemini",
-    model: "gemini-3.5-flash",
+    model: "gemini-2.5-flash",
     reasoning: "medium",
   })
+  const normalizeAgent = (agent: AppSettings["mainAgent"]) => {
+    const configured = providers.find((provider) => provider.id === agent.provider)?.keyConfigured
+    const provider: ProviderId = configured ? agent.provider : (configuredFallback ?? agent.provider)
+    const model =
+      provider !== agent.provider || /^(gemini-3\.5|gpt-5\.[45])/.test(agent.model)
+        ? providerCatalog[provider].defaultModel
+        : agent.model
+    return { ...agent, provider, model }
+  }
+  const mainAgent = normalizeAgent(savedMainAgent)
+  const workerAgent = normalizeAgent(savedWorkerAgent)
   return {
     defaultProvider,
     defaultModel,
@@ -203,7 +221,7 @@ export function getAppSettings(): AppSettings {
     workerAgent,
     theme: getSetting("theme", "system"),
     businessContext: getSetting("businessContext", defaultBusinessContext),
-    providers: listProviderConfigs(),
+    providers,
   }
 }
 

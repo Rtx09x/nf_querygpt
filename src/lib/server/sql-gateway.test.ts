@@ -27,4 +27,20 @@ describe("sql gateway", () => {
     expect(result.rows[0].users).toBe(2000)
     expect(result.sql).toBe("SELECT COUNT(*) AS users FROM users")
   })
+
+  it("preserves column names when a valid query returns no rows", () => {
+    const result = runReadonlyQuery({
+      sql: "SELECT user_id, full_name FROM users WHERE user_id = -1",
+    })
+    expect(result.columns).toEqual(["user_id", "full_name"])
+    expect(result.rows).toEqual([])
+    expect(result.totalRows).toBe(0)
+  })
+
+  it("allows safe CTE aliases while still validating real source tables", () => {
+    const result = runReadonlyQuery({
+      sql: "WITH recent AS (SELECT user_id FROM users LIMIT 3) SELECT COUNT(*) AS rows_seen FROM recent",
+    })
+    expect(result.rows[0].rows_seen).toBe(3)
+  })
 })
